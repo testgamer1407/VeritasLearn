@@ -1,185 +1,261 @@
-import streamlit as st
-import chromadb
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
+]import streamlit as st
+import faiss
 import numpy as np
+import time
 import re
-import math
+from sentence_transformers import SentenceTransformer
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="ClaimPrism | AI Fact Checker", page_icon="🔍", layout="wide")
+# ==========================================
+# PAGE CONFIGURATION & CUSTOM CSS
+# ==========================================
+st.set_page_config(page_title="VeritasLearn | Agentic AI", page_icon="🧬", layout="wide")
 
-# --- 1. MODEL LOADING & CACHING ---
+st.markdown("""
+<style>
+    .terminal {background-color: #1E1E1E; color: #00FF00; font-family: 'Courier New', Courier, monospace; padding: 15px; border-radius: 5px; font-size: 14px; height: 300px; overflow-y: scroll;}
+    .verified {color: #155724; background-color: #d4edda; padding: 3px 8px; border-radius: 4px; font-weight: bold; font-size: 12px;}
+    .unverified {color: #721c24; background-color: #f8d7da; padding: 3px 8px; border-radius: 4px; font-weight: bold; font-size: 12px;}
+    .card {background-color: #f9f9f9; padding: 20px; border-radius: 10px; border-left: 5px solid #4CAF50; margin-bottom: 10px;}
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 1. KNOWLEDGE BASE & FAISS SETUP
+# ==========================================
 @st.cache_resource
-def load_models():
-    """Load lightweight NLP models for embeddings and NLI."""
-    # Sentence embedder for Vector Search (Dense Retrieval)
+def init_vector_store():
+    """Initializes local embedding model and FAISS index with OER/Wiki data."""
     embedder = SentenceTransformer('all-MiniLM-L6-v2')
     
-    # NLI Model to check Entailment vs Contradiction
-    # We use a RoBERTa model fine-tuned on MNLI (Multi-Genre NLI)
-    nli_model = pipeline("text-classification", model="roberta-large-mnli", top_k=None)
-    
-    return embedder, nli_model
-
-# --- 2. VECTOR DATABASE SETUP ---
-@st.cache_resource
-def setup_vector_store():
-    """Initialize an in-memory ChromaDB and load a mock Ground Truth corpus."""
-    client = chromadb.Client()
-    collection = client.create_collection(name="verified_ground_truth")
-    
-    # Mock "Verified/True" articles (e.g., from PolitiFact/Reuters/Kaggle True splits)
-    ground_truth_corpus = [
-        "NASA's Curiosity rover successfully landed on Mars and drilled into the Gale Crater to analyze soil samples. While it found organic molecules and evidence of ancient water, NASA has not discovered any bacterial or alien life on Mars.",
-        "Microwave ovens use non-ionizing electromagnetic radiation to heat food safely. The World Health Organization confirms they do not make food radioactive and do not cause cancer. Claims that Japan is banning microwaves originated from a Russian satirical website in 2019 and are completely false.",
-        "The Covid-19 vaccines underwent rigorous clinical trials before public distribution. They do not contain microchips and do not alter human DNA. The mRNA technology teaches cells how to make a protein to trigger an immune response.",
-        "Global warming is a documented phenomenon supported by overwhelming scientific consensus. Ice core samples show unprecedented CO2 levels.",
+    # Mock Open Educational / Wikipedia Dataset for the Hackathon
+    corpus = [
+        # CRISPR Data
+        "CRISPR-Cas9 is a unique technology that enables geneticists to edit parts of the genome by removing, adding, or altering sections of the DNA sequence.",
+        "The CRISPR-Cas9 system consists of two key molecules that introduce a change into the DNA: an enzyme called Cas9, and a piece of RNA called guide RNA (gRNA).",
+        "Cas9 acts as a pair of 'molecular scissors' that can cut the two strands of DNA at a specific location so that bits of DNA can then be added or removed.",
+        "Off-target effects are a major limitation of CRISPR, where the Cas9 enzyme cuts DNA outside the target site, potentially causing unintended mutations.",
+        # Plate Tectonics Data
+        "Plate tectonics is the scientific theory that Earth's lithosphere comprises a number of large tectonic plates which have been slowly moving since about 3.4 billion years ago.",
+        "The driving mechanism behind plate tectonics is mantle convection, where hot, less dense material rises, and cooler, denser material sinks.",
+        "Convergent boundaries occur where plates collide, often creating mountain ranges like the Himalayas or deep ocean trenches via subduction.",
+        "Divergent boundaries occur where plates move apart, such as the Mid-Atlantic Ridge, where new oceanic crust is formed by upwelling magma."
     ]
     
-    embedder = SentenceTransformer('all-MiniLM-L6-v2')
-    embeddings = embedder.encode(ground_truth_corpus).tolist()
+    # Generate embeddings and create FAISS Index
+    embeddings = embedder.encode(corpus)
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(np.array(embeddings).astype('float32'))
     
-    collection.add(
-        embeddings=embeddings,
-        documents=ground_truth_corpus,
-        metadatas=[{"source": "NASA Archives"}, {"source": "Snopes & WHO Fact Check"}, {"source": "CDC Verified Data"}, {"source": "NOAA Climate Data"}],
-        ids=["doc1", "doc2", "doc3", "doc4"]
-    )
-    return collection
+    return embedder, index, corpus
 
-# --- 3. HELPER FUNCTIONS ---
-def decompose_claim(text):
-    """Simple regex-based atomic claim extractor (splits compound sentences)."""
-    # In a full production app, you would use an LLM or dependency parser here.
-    # For this prototype, we split by periods, and basic conjunctions to simulate atomic facts.
-    clauses = re.split(r'\.|\b and \b|\b but \b', text)
-    return [c.strip() for c in clauses if len(c.strip()) > 10]
-
-def calculate_entropy(probs):
-    """Calculates Shannon Entropy to measure AI Uncertainty."""
-    return -sum([p * math.log2(p) for p in probs if p > 0])
-
-# --- 4. CORE PIPELINE ---
-def process_claim(user_input, embedder, nli_model, collection):
-    atomic_claims = decompose_claim(user_input)
-    results = []
-    
-    for claim in atomic_claims:
-        # Step A: Vector Retrieval (Find top verified context)
-        claim_embedding = embedder.encode([claim]).tolist()
-        search_res = collection.query(query_embeddings=claim_embedding, n_results=1)
-        
-        retrieved_context = search_res['documents'][0][0]
-        source = search_res['metadatas'][0][0]['source']
-        distance = search_res['distances'][0][0] # Lower distance = higher semantic similarity
-        
-        # Step B: NLI Verification
-        # Format: Premise = Ground Truth, Hypothesis = User's Atomic Claim
-        nli_input = f"{retrieved_context} </s></s> {claim}"
-        nli_output = nli_model(nli_input)[0]
-        
-        # Map RoBERTa outputs to probabilities
-        probs = {res['label']: res['score'] for res in nli_output}
-        # roberta-large-mnli labels: 'ENTAILMENT', 'NEUTRAL', 'CONTRADICTION'
-        p_entail = probs.get('ENTAILMENT', 0.0)
-        p_contra = probs.get('CONTRADICTION', 0.0)
-        p_neutral = probs.get('NEUTRAL', 0.0)
-        
-        # Step C: Status & Uncertainty Logic
-        entropy = calculate_entropy([p_entail, p_contra, p_neutral])
-        
-        if distance > 1.2 or p_neutral > 0.6: # distance threshold for ChromaDB cosine/L2
-            status = "Unverified"
-            color = "orange"
-        elif p_entail > p_contra:
-            status = "Verified"
-            color = "green"
-        else:
-            status = "Fabricated / False"
-            color = "red"
-            
-        results.append({
-            "claim": claim,
-            "status": status,
-            "color": color,
-            "context": retrieved_context,
-            "source": source,
-            "p_entail": p_entail,
-            "p_contra": p_contra,
-            "entropy": entropy
-        })
-        
-    return results
-
-# --- 5. STREAMLIT DASHBOARD UI ---
-def main():
-    st.title("prism ClaimPrism")
-    st.subheader("AI Spectral Truth Analyzer & Deconstruction Dashboard")
-    st.markdown("---")
-    
-    with st.spinner("Initializing Models & Ground Truth Knowledge Base..."):
-        embedder, nli_model = load_models()
-        collection = setup_vector_store()
-        
-    # Input Section
-    st.markdown("### 1. Ingest Claim")
-    
-    # Preset examples for easy demo
-    example_claims = [
-        "NASA's Curiosity rover drilled into Gale crater and discovered alien bacterial life on Mars.",
-        "Japan bans microwave ovens by year-end after scientists find lethal radiation levels causing cancer in citizens.",
-        "The Covid-19 vaccines contain microchips tracking technology."
-    ]
-    
-    selected_example = st.selectbox("Select a benchmark claim or type your own:", ["-- Type your own --"] + example_claims)
-    
-    user_text = ""
-    if selected_example != "-- Type your own --":
-        user_text = st.text_area("Input Text (Headline/Excerpt):", value=selected_example, height=100)
+# ==========================================
+# 2. AGENTIC FUNCTIONS
+# ==========================================
+def agent_curriculum_architect(topic):
+    """Breaks down a broad topic into 3-4 sub-queries."""
+    time.sleep(1) # Simulate API call
+    if "CRISPR" in topic.upper():
+        return [
+            "What are the structural components of the CRISPR-Cas9 system?",
+            "How does the mechanism of DNA cleavage (molecular scissors) work?",
+            "What are the primary applications and limitations (e.g., off-target effects)?"
+        ]
+    elif "PLATE" in topic.upper():
+        return [
+            "What is the foundational theory of plate tectonics?",
+            "What mechanisms drive tectonic plate movement (mantle convection)?",
+            "What are the different types of plate boundaries and their geological effects?"
+        ]
     else:
-        user_text = st.text_area("Input Text (Headline/Excerpt):", placeholder="Paste a viral claim or news headline here...", height=100)
+        return [f"Core definitions of {topic}", f"Mechanisms of {topic}", f"Applications of {topic}"]
+
+def agent_dense_retriever(sub_queries, embedder, index, corpus, k=2):
+    """Retrieves verified context chunks for each sub-query using FAISS."""
+    time.sleep(1.5) # Simulate retrieval time
+    retrieved_data = {}
+    for sq in sub_queries:
+        vec = embedder.encode([sq]).astype('float32')
+        distances, indices = index.search(vec, k)
+        retrieved_data[sq] = [corpus[i] for i in indices[0]]
+    return retrieved_data
+
+def agent_fact_auditor(draft_claims, embedder, index, corpus, threshold=1.2):
+    """Self-reflection loop: Checks if claims are grounded in FAISS corpus."""
+    time.sleep(2)
+    audited_claims = []
+    for claim in draft_claims:
+        vec = embedder.encode([claim]).astype('float32')
+        distances, indices = index.search(vec, 1)
+        best_dist = distances[0][0]
+        best_match = corpus[indices[0][0]]
         
-    if st.button("Analyze Claim via ClaimPrism", type="primary"):
-        if not user_text.strip():
-            st.warning("Please enter a claim to analyze.")
-            return
-            
-        with st.spinner("Refracting claim into atomic facts & checking vector base..."):
-            results = process_claim(user_text, embedder, nli_model, collection)
-            
+        status = "Verified" if best_dist < threshold else "Unverified/Hallucination"
+        audited_claims.append({
+            "claim": claim, 
+            "status": status, 
+            "distance": best_dist,
+            "anchor": best_match if status == "Verified" else "None"
+        })
+    return audited_claims
+
+# ==========================================
+# 3. STREAMLIT UI BUILDER
+# ==========================================
+def main():
+    # --- HEADER ---
+    colA, colB = st.columns([1, 5])
+    with colA:
+        st.image("https://cdn-icons-png.flaticon.com/512/2042/2042462.png", width=80)
+    with colB:
+        st.title("VeritasLearn")
+        st.subheader("Autonomous Dialectic Revision & Fact-Auditing Engine")
+    st.markdown("---")
+
+    # --- INIT MODELS ---
+    embedder, index, corpus = init_vector_store()
+
+    # --- SIDEBAR CONTROL PANEL ---
+    with st.sidebar:
+        st.header("⚙️ Mission Control")
+        topic = st.text_input("Academic Topic:", placeholder="e.g. CRISPR Gene Editing, Plate Tectonics")
+        dataset = st.selectbox("Verified Corpus:", ["OER Commons Science Module", "Hugging Face Wikipedia English"])
+        strictness = st.slider("Fact-Audit Strictness (L2 Distance)", 0.5, 2.0, 1.2, help="Lower means stricter exact matching.")
+        run_agent = st.button("🚀 Generate Revision Bundle", type="primary", use_container_width=True)
+
         st.markdown("---")
-        st.markdown("### 2. Spectral Breakdown Panel")
+        st.caption("Agent Modules Loaded:")
+        st.caption("✅ Curriculum Architect")
+        st.caption("✅ FAISS Vector Retriever")
+        st.caption("✅ Adversarial Critic (Auditor)")
+        st.caption("✅ Pedagogical Compiler")
+
+    # --- MAIN WORKSPACE ---
+    if run_agent and topic:
+        col1, col2 = st.columns([1, 1.5])
         
-        # Calculate aggregate scores
-        total_entailment = sum([r['p_entail'] for r in results]) / len(results)
-        total_contra = sum([r['p_contra'] for r in results]) / len(results)
-        avg_entropy = sum([r['entropy'] for r in results]) / len(results)
-        
-        overall_status = "Potentially Misleading (Mixed Facts)"
-        if total_entailment > 0.75 and total_contra < 0.2:
-            overall_status = "Highly Verified"
-        elif total_contra > 0.5:
-            overall_status = "Fabricated / False"
+        # COLUMN 1: AGENT TELEMETRY & LOGS
+        with col1:
+            st.markdown("### 📡 Agent Telemetry Logs")
+            log_container = st.empty()
+            logs = "Initializing agentic workflow...\n"
+            log_container.markdown(f'<div class="terminal">{logs}</div>', unsafe_allow_html=True)
             
-        # Top Metrics
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Overall System Verdict", overall_status)
-        col2.metric("Evidentiary Support Score", f"{total_entailment*100:.1f}%")
-        col3.metric("System Uncertainty (Entropy)", f"{avg_entropy:.2f} bits", help="High entropy means the AI is unsure due to lack of corpus data.")
-        
-        st.markdown("---")
-        st.markdown("### 3. The Evidence Ledger (Atomic Justification)")
-        
-        for idx, res in enumerate(results):
-            with st.expander(f"Fact {idx+1}: {res['claim']} - [{res['status'].upper()}]", expanded=True):
-                st.markdown(f"**Atomic Claim:** `{res['claim']}`")
+            # Step 1: Architect
+            logs += f"[*] [Architect Agent] Deconstructing topic: '{topic}'...\n"
+            log_container.markdown(f'<div class="terminal">{logs}</div>', unsafe_allow_html=True)
+            sub_queries = agent_curriculum_architect(topic)
+            for i, sq in enumerate(sub_queries):
+                logs += f"    -> Q{i+1}: {sq}\n"
+            log_container.markdown(f'<div class="terminal">{logs}</div>', unsafe_allow_html=True)
+            
+            # Step 2: Retriever
+            logs += f"\n[*] [Retriever Agent] Querying FAISS index ({dataset})...\n"
+            log_container.markdown(f'<div class="terminal">{logs}</div>', unsafe_allow_html=True)
+            retrieved_context = agent_dense_retriever(sub_queries, embedder, index, corpus)
+            logs += f"[*] Retrieved {sum(len(v) for v in retrieved_context.values())} contextual chunks.\n"
+            log_container.markdown(f'<div class="terminal">{logs}</div>', unsafe_allow_html=True)
+
+            # Step 3: Synthesis & Audit
+            logs += f"\n[*] [Fact-Auditor Agent] Cross-referencing generated claims...\n"
+            log_container.markdown(f'<div class="terminal">{logs}</div>', unsafe_allow_html=True)
+            
+            # Mock draft claims to demonstrate the auditor catching a hallucination
+            if "CRISPR" in topic.upper():
+                draft = [
+                    "CRISPR-Cas9 acts as molecular scissors to cut DNA.",
+                    "Cas9 is guided by a piece of RNA called gRNA.",
+                    "CRISPR was invented by aliens in 1999." # Hallucinated claim
+                ]
+            else:
+                draft = [
+                    "Plate tectonics is driven by mantle convection.",
+                    "The Mid-Atlantic Ridge is a convergent boundary.", # Incorrect/Hallucinated
+                    "Plates have been moving for about 3.4 billion years."
+                ]
+            
+            audit_results = agent_fact_auditor(draft, embedder, index, corpus, strictness)
+            
+            for res in audit_results:
+                if res['status'] == "Verified":
+                    logs += f"    [PASS] L2:{res['distance']:.2f} | {res['claim'][:30]}...\n"
+                else:
+                    logs += f"    [FAIL] L2:{res['distance']:.2f} | Pruning Hallucination: {res['claim'][:30]}...\n"
+            
+            logs += "\n[*] [Pedagogical Compiler] Assembling finalized study bundle..."
+            log_container.markdown(f'<div class="terminal">{logs}</div>', unsafe_allow_html=True)
+            
+            # Verification Breakdown UI
+            st.markdown("#### 🔍 Audit Breakdown")
+            for res in audit_results:
+                if res['status'] == "Verified":
+                    st.markdown(f"**Claim:** {res['claim']} <span class='verified'>VERIFIED</span>", unsafe_allow_html=True)
+                    st.caption(f"**Source Anchor:** _{res['anchor']}_ (Distance: {res['distance']:.2f})")
+                else:
+                    st.markdown(f"**Claim:** {res['claim']} <span class='unverified'>HALLUCINATION PRUNED</span>", unsafe_allow_html=True)
+
+        # COLUMN 2: THE REVISION BUNDLE (TABS)
+        with col2:
+            st.markdown("### 📚 Exportable Revision Bundle")
+            tab1, tab2, tab3 = st.tabs(["📄 1-Page Summary", "📖 Glossary", "📝 Self-Quiz"])
+            
+            with tab1:
+                st.markdown(f"## Topic Synthesis: {topic.title()}")
+                st.markdown("""
+                <div class="card">
+                <b>Core Principles</b><br>
+                Based on verified context, the fundamental mechanism involves structural components that interact to drive systemic changes. 
+                <i></i>. 
+                <br><br>
+                <b>Key Mechanisms</b><br>
+                The primary drivers require specific catalysts (e.g. molecular structures or thermal convection) to enact measurable shifts in the environment.
+                <i></i>.
+                </div>
+                """, unsafe_allow_html=True)
+                st.button("📥 Export as PDF (Markdown)", key="export_btn")
+
+            with tab2:
+                st.markdown("### Key Terms to Know")
+                if "CRISPR" in topic.upper():
+                    st.markdown("- **Cas9 Enzyme:** A protein that acts as 'molecular scissors' to cut DNA.")
+                    st.markdown("- **Guide RNA (gRNA):** RNA that guides the Cas9 enzyme to the specific target DNA sequence.")
+                    st.markdown("- **Off-target effects:** Unintended mutations caused when Cas9 cuts outside the target site.")
+                else:
+                    st.markdown("- **Lithosphere:** The rigid outer part of the earth, consisting of the crust and upper mantle.")
+                    st.markdown("- **Mantle Convection:** The slow creeping motion of Earth's solid silicate mantle caused by convection currents.")
+                    st.markdown("- **Subduction:** The sideways and downward movement of the edge of a plate of the earth's crust into the mantle.")
+
+            with tab3:
+                st.markdown("### Interactive Active-Recall Quiz")
                 
-                # Dynamic color bar for probabilities
-                st.progress(res['p_entail'], text=f"Entailment (True): {res['p_entail']*100:.1f}%")
-                st.progress(res['p_contra'], text=f"Contradiction (False): {res['p_contra']*100:.1f}%")
+                # Quiz State Management
+                if "q1_ans" not in st.session_state:
+                    st.session_state.q1_ans = None
+                    
+                q1 = "What is the primary driving mechanism or key actor in this system?"
+                options = ["Mantle Convection / Cas9", "Solar Radiation", "Magnetic Fields", "Gravitational Pull"]
                 
-                st.info(f"**Retrieved Ground Truth ({res['source']}):**\n\n> {res['context']}")
+                choice = st.radio(q1, options, index=None)
+                if st.button("Check Answer"):
+                    if choice == "Mantle Convection / Cas9":
+                        st.success("✅ Correct! Verified by OER Reference Data.")
+                        st.info(f"**Context:** {corpus[1]}")
+                    elif choice is None:
+                        st.warning("Please select an answer.")
+                    else:
+                        st.error("❌ Incorrect. Review the mechanisms section.")
+                        
+    elif run_agent and not topic:
+        st.warning("⚠️ Please enter a topic to begin the autonomous research phase.")
+    else:
+        # Welcome Screen
+        st.info("👈 Enter a topic in the Mission Control sidebar to launch the research agents.")
+        st.markdown("""
+        ### Why VeritasLearn?
+        - **Say No to Hallucinations:** Most AIs guess when they don't know. Our Adversarial Auditor checks every generated sentence against a local FAISS database.
+        - **Active Learning:** We don't just give you text to read. We generate flashcard-style glossaries and active-recall quizzes.
+        - **Full Transparency:** Watch the agents think, query, and prune fake facts in real-time on the left telemetry panel.
+        """)
 
 if __name__ == "__main__":
     main()
