@@ -8,9 +8,8 @@ import re
 import time
 from sentence_transformers import SentenceTransformer
 
-# =========================================================
 # 1. PAGE CONFIGURATION & THEME-SAFE STYLING
-# =========================================================
+
 st.set_page_config(
     page_title="VeritasLearn | Smart Study Engine",
     page_icon="🎓",
@@ -68,9 +67,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# =========================================================
+
 # 2. DYNAMIC KNOWLEDGE RETRIEVAL & VECTOR ENGINE
-# =========================================================
+
 @st.cache_resource(show_spinner=False)
 def load_embedder():
     """Loads lightweight CPU embedding model."""
@@ -140,9 +139,9 @@ def build_faiss_index(chunks, embedder):
     index.add(embeddings.astype('float32'))
     return index, embeddings
 
-# =========================================================
+
 # 3. AGENTIC WORKFLOW MODULES
-# =========================================================
+
 def agent_curriculum_architect(topic: str):
     """Module 1: Breaks down any topic into 4 simple research questions."""
     clean_topic = topic.strip().title()
@@ -244,9 +243,9 @@ def extract_glossary_and_quiz(chunks, topic_title):
 
     return glossary[:5], quiz
 
-# =========================================================
+
 # 4. STREAMLIT USER INTERFACE
-# =========================================================
+
 def main():
     # --- Top Navigation / Banner ---
     st.title("🎓 VeritasLearn")
@@ -363,7 +362,7 @@ def main():
     if "bundle" in st.session_state:
         bundle = st.session_state.bundle
         
-        # High Level Metric Summary
+       
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         verified_count = sum(1 for a in bundle["audit_results"] if a["verified"])
         total_claims = len(bundle["audit_results"])
