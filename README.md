@@ -1,1 +1,1 @@
-# Claim-Prism
+# VeritasLearn
